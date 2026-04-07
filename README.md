@@ -242,5 +242,19 @@ Python
             last_upload_time = now_dt
 finally:
 cap.release()
+
+ultralytics
+opencv-python
+psycopg2-binary
+streamlit
+pandas
+scikit-learn
+notebook
+lapx
+boto3
+yt-dlp
+seaborn
+minio
+apache-airflow
 cv2.destroyAllWindows()
 if db_conn: db_conn.close()
