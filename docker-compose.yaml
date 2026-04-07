@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  # 1. Твой бесконечный детектор
+  detector:
+    build: .
+    container_name: traffic_detector
+    restart: always
+    network_mode: "host" # Позволяет контейнеру видеть внешнюю сеть без ограничений
+    environment:
+      # Прописываем данные ТВОЕГО внешнего сервера
+      - DB_URL=host=2.nntc.nnov.ru port=5402 dbname=user43 user=user43 password=m5q3x8tpc7vn
+      - RTMP_URL=rtmp://2.nntc.nnov.ru:5566/stream
+      - MINIO_ENDPOINT=2.nntc.nnov.ru:9000
+      - MINIO_KEY=6f9tmxqp4zrb
+      - MINIO_SECRET=6f9tmxqp4zrb
+
+  # 2. Airflow для предиктора и очистки
+  airflow:
+    image: apache/airflow:2.7.0
+    container_name: traffic_airflow
+    network_mode: "host"
+    environment:
+      # Airflow тоже должен знать, куда писать результаты прогноза
+      - DB_URL=host=2.nntc.nnov.ru port=5402 dbname=user43 user=user43 password=m5q3x8tpc7vn
+      # Внутренняя база самого Airflow (ему она нужна для работы)
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////opt/airflow/airflow.db
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./scripts:/opt/airflow/scripts
