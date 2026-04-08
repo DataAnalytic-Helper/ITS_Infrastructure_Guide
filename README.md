@@ -263,3 +263,162 @@ minio
 apache-airflow
 cv2.destroyAllWindows()
 if db_conn: db_conn.close()
+
+
+
+import cv2
+import numpy as np
+import time
+import io
+import os
+from datetime import datetime
+from ultralytics import YOLO
+from minio import Minio
+import psycopg2
+
+
+
+
+Этот код — это ETL-процесс в реальном времени: Извлечение (Extract) данных из видео, Преобразование (Transform) координат в метры и Загрузка (Load) в базу данн
+
+
+# ==========================================
+# 1. КОНФИГУРАЦИЯ И НАСТРОЙКИ (Константы)
+# ==========================================
+RTMP_URL = "rtmp://your_server_ip/live/stream"  # Источник видео
+PIXELS_PER_METER = 20  # Коэффициент масштабирования (подбирается по кадру)
+REAL_DIST_M = 15.0     # Дистанция между контрольными линиями в метрах
+LINE_THRESHOLD = 15    # Чувствительность срабатывания линии (в пикселях)
+
+# Координаты зоны ROI (в процентах от 0.0 до 1.0 для универсальности)
+ROI_PERCENT_POINTS = [(0.1, 0.4), (0.9, 0.4), (0.9, 0.9), (0.1, 0.9)]
+
+# Линии замера скорости (x1, y1, x2, y2)
+LINE_START = (200, 400, 1000, 400) 
+LINE_END = (200, 700, 1000, 700)
+
+# ==========================================
+# 2. МАТЕМАТИЧЕСКИЙ БЛОК (Логика аналитики)
+# ==========================================
+
+def point_line_distance(px, py, x1, y1, x2, y2):
+    """Вычисляет кратчайшее расстояние от точки до отрезка (Евклидова метрика)"""
+    line_vec = np.array([x2 - x1, y2 - y1])
+    p_vec = np.array([px - x1, py - y1])
+    line_len = np.linalg.norm(line_vec)
+    if line_len == 0: return np.linalg.norm(p_vec)
+    t = np.clip(np.dot(line_vec / line_len, p_vec / line_len), 0, 1)
+    nearest = line_vec * t
+    return np.linalg.norm(p_vec - nearest)
+
+def get_pixel_coords(percent_points, w, h):
+    """Преобразование процентов в реальные пиксели кадра"""
+    return np.array([[int(x * w), int(y * h)] for x, y in percent_points], np.int32)
+
+# ==========================================
+# 3. ИНФРАСТРУКТУРА (Подключения)
+# ==========================================
+
+def init_connections():
+    """Инициализация соединений с БД и хранилищем"""
+    # MinIO (Docker)
+    try:
+        m_client = Minio("localhost:9000", access_key="minio_admin", secret_key="minio_password", secure=False)
+        if not m_client.bucket_exists("traffic-snapshots"):
+            m_client.make_bucket("traffic-snapshots")
+    except: m_client = None
+
+    # PostgreSQL
+    try:
+        db = psycopg2.connect(host="localhost", database="its_db", user="user43", password="password")
+        db.autocommit = True
+    except: db = None
+    
+    return m_client, db
+
+# ==========================================
+# 4. ОСНОВНОЙ ЦИКЛ ДЕТЕКЦИИ (ETL Процесс)
+# ==========================================
+
+def run_detector():
+    m_client, db_conn = init_connections()
+    cursor = db_conn.cursor() if db_conn else None
+    
+    model = YOLO("yolov8n.pt")
+    cap = cv2.VideoCapture(RTMP_URL)
+    
+    # Словари для хранения состояний объектов
+    entry_times = {}   # {id: время_входа}
+    final_speeds = {}  # {id: скорость}
+    processed_ids = set()
+    
+    try:
+        while True:
+            success, frame = cap.read()
+            if not success:
+                time.sleep(5)
+                cap = cv2.VideoCapture(RTMP_URL); continue
+
+            h, w = frame.shape[:2]
+            now_ts = time.time()
+            roi_pixels = get_pixel_coords(ROI_PERCENT_POINTS, w, h)
+
+            # --- ИНФЕРЕНС И ТРЕКИНГ ---
+            results = model.track(frame, persist=True, verbose=False, classes=[2, 3, 5, 7])
+
+            if results[0].boxes.id is not None:
+                boxes = results[0].boxes.xyxy.cpu().numpy()
+                ids = results[0].boxes.id.cpu().numpy().astype(int)
+                clss = results[0].boxes.cls.cpu().numpy().astype(int)
+
+                for i in range(len(ids)):
+                    x1, y1, x2, y2 = boxes[i]
+                    t_id, cx, cy = ids[i], (x1 + x2) / 2, (y1 + y2) / 2
+                    
+                    # 1. Фильтрация по зоне ROI (Слой ODS)
+                    if cv2.pointPolygonTest(roi_pixels, (int(cx), int(cy)), False) < 0:
+                        continue
+
+                    # 2. Расчет скорости (Математический блок)
+                    d_start = point_line_distance(cx, cy, *LINE_START)
+                    d_end = point_line_distance(cx, cy, *LINE_END)
+
+                    if d_start < LINE_THRESHOLD and t_id not in entry_times:
+                        entry_times[t_id] = now_ts
+
+                    if d_end < LINE_THRESHOLD and t_id in entry_times and t_id not in processed_ids:
+                        duration = now_ts - entry_times[t_id]
+                        if duration > 0.3:
+                            speed = (REAL_DIST_M / duration) * 3.6
+                            final_speeds[t_id] = speed
+                            processed_ids.add(t_id)
+
+                    # 3. Загрузка данных в DWH (Слой RAW/ODS)
+                    if cursor:
+                        try:
+                            cursor.execute("""
+                                INSERT INTO full_tracking_data 
+                                (track_id, object_type, x_cord_m, y_cord_m, speed_km_h, detection_time) 
+                                VALUES (%s, %s, %s, %s, %s, NOW())
+                            """, (int(t_id), model.names[clss[i]], float(cx/PIXELS_PER_METER), 
+                                  float(cy/PIXELS_PER_METER), float(final_speeds.get(t_id, 0)))
+                            )
+                        except: pass
+
+            # --- ВИЗУАЛИЗАЦИЯ ---
+            # Отрисовка ROI и линий
+            cv2.polylines(frame, [roi_pixels], True, (255, 191, 0), 2)
+            cv2.line(frame, LINE_START[:2], LINE_START[2:], (0, 255, 0), 2)
+            cv2.line(frame, LINE_END[:2], LINE_END[2:], (0, 0, 255), 2)
+            
+            cv2.imshow('ITS Analytics System', cv2.resize(frame, (1280, 720)))
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        if db_conn: db_conn.close()
+
+if __name__ == "__main__":
+    run_detector()
+
